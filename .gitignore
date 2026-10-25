@@ -1,0 +1,19 @@
+# данные задания: выдаются вместе с заданием, в репозиторий не кладём
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# результаты прогонов на train (answers.jsonl для test — в репозитории)
+train_answers*.jsonl
+*.log
+
+# редакторы и ОС
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
