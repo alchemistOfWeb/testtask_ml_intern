@@ -10,6 +10,7 @@
 """
 import csv
 import json
+import math
 import re
 import sys
 from collections import Counter, defaultdict
@@ -26,11 +27,17 @@ CHECK_DATE = date(2026, 10, 1)
 ROOT = Path(__file__).resolve().parent
 
 PARAMS = {
+    # Пороги уверенности задаются по «профилю» снимка: источник + плохой ли снимок.
+    # Снимок плохой, если паспорт мелкий, нерезкий или с бликами: на таких у web даже
+    # символы с conf >= 0.99 ошибочны в 0.5-1% случаев, а на хороших — в 0.03%.
+    "bad_photo": {"doc_px": 1300, "sharpness": 120, "glare": 0.15},
     # Минимальный char_conf для текста, который нечем подтвердить, кроме самого OCR.
     # У mobile_v2 97% символов имеют conf=1.0, поэтому порог у неё почти единица.
-    "text_min_conf": {"web": 0.93, "mobile": 0.93, "mobile_v2": 0.999},
+    "text_min_conf": {"web": 0.93, "mobile": 0.93, "mobile_v2": 0.999,
+                      "web_bad": 0.93, "mobile_bad": 0.93, "mobile_v2_bad": 0.999},
     # Слово из словаря train принимаем с уверенностью пониже (None — не используем).
-    "known_word_min_conf": {"web": 0.9, "mobile": 0.9, "mobile_v2": None},
+    "known_word_min_conf": {"web": 0.9, "mobile": 0.9, "mobile_v2": None,
+                            "web_bad": 0.9, "mobile_bad": 0.9, "mobile_v2_bad": None},
     "known_word_min_count": 3,
     # Исправление слова на словарное заменой одного символа с уверенностью ниже
     # word_fix_max_conf; кандидат должен встречаться в train не реже word_fix_min_count.
@@ -40,9 +47,28 @@ PARAMS = {
     "word_fix_min_count": 3,
     # OCR часто теряет символ целиком («С» вместо «С.», «ОССИИ»), и уверенность это не
     # ловит. Слово подозрительно, если на расстоянии 1 есть слово, которое в train
-    # встречается в near_ratio раз чаще (и не реже near_min раз).
+    # встречается в near_ratio раз чаще (и не реже near_min раз). Оценка риска по
+    # частоте потери символа (viz теряет точку в 0.7% случаев) на CV вышла хуже:
+    # «ОБЛ»/«ОБЛ.» и «ПГТ»/«ПГТ.» оба частые, и отсечь их стоит ~300 документов.
     "near_ratio": 10,
     "near_min": 5,
+    # Потерянную точку/дефис восстанавливаем, а не отклоняем документ: «С» без точки
+    # в разметке «Места рождения» не встречается ни разу, а «С.» — 648 раз.
+    "punct_restore": True,
+    "punct_restore_min": 20,
+    # Дата, у которой все 8 цифр на месте, а разделители потеряны или задвоены
+    # («21.052007», «23.07..2017»), и «ЖЕН» без точки — приводим к формату разметки.
+    "fix_format": True,
+    # Модель слов (градиентный бустинг по уверенности букв, частоте слова в train,
+    # источнику и качеству снимка): принимаем слово, если риск ошибки <= word_model_max_p.
+    # "rescue" — модель только спасает слова, которые не прошли правила; "replace" —
+    # модель решает за правила (уверенность, словарь, потеря символа). None — выключена.
+    # На CV: rescue 0.002-0.005 даёт +16..23 документа без новых ошибок, 0.01 — +1
+    # ошибка; replace принимает меньше правил. Для mobile_v2 даёт ошибки («ВОСТОВ»).
+    # Пока выключена: прирост ~1% не стоит зависимости от scikit-learn и 26 с на запуск.
+    "word_model_max_p": {"web": None, "mobile": None, "mobile_v2": None,
+                         "web_bad": None, "mobile_bad": None, "mobile_v2_bad": None},
+    "word_model_mode": "rescue",
     # «Кем выдан»: исправление на название из словаря по коду подразделения.
     "org_fix_max_edits": 3,
     "org_fix_max_conf": 0.95,
@@ -61,10 +87,16 @@ PARAMS = {
     "mrz_only_name_min_conf": 0.99,
     # Если MRZ под контрольной цифрой расходится с viz, брать значение из MRZ.
     "trust_mrz_on_mismatch": True,
+    # Строка 2 MRZ испорчена (длина не 44, не сошлась контрольная цифра): поле viz
+    # подтверждено, если при выравнивании строка повторяет его символ в символ.
+    # need_check — требовать, чтобы совпала и контрольная цифра этого поля.
+    "mrz2_align": True,
+    "mrz2_align_need_check": False,
     # MRZ нет или нужная её часть нечитаема: поля, которые она дублирует, принимаем
     # по одной viz с уверенностью не ниже этой (None — не принимаем).
     # На CV: 0.98 даёт ошибки, 0.985 и 0.99 — нет. У mobile_v2 conf не информативна.
-    "viz_only_min_conf": {"web": 0.99, "mobile": 0.99, "mobile_v2": None},
+    "viz_only_min_conf": {"web": 0.99, "mobile": 0.99, "mobile_v2": None,
+                          "web_bad": 0.99, "mobile_bad": 0.99, "mobile_v2_bad": None},
     # В разметке train 43 кода, которых нет в справочнике (он от 2026-07), поэтому
     # отсутствие кода в справочнике само по себе не ошибка.
     "require_code_in_reference": False,
@@ -111,6 +143,53 @@ def mrz_date(yymmdd):
     return s if parse_date(s) else None
 
 
+# где в строке 2 лежит каждое поле и какая контрольная цифра его защищает
+LINE2_SPANS = {
+    "Licence_number": (list(range(0, 9)) + [28], 9),
+    "Birth_date": (list(range(13, 19)), 19),
+    "Sex_ru": ([20], 43),
+    "Issue_date": (list(range(29, 35)), 42),
+    "Issue_organisation_code": (list(range(35, 41)), 42),
+}
+
+
+def expected_line2(values):
+    """Строка 2 MRZ, какой она должна быть по значениям viz; неизвестное — '?'."""
+    def yymmdd(s):
+        return f"{s[8:10]}{s[3:5]}{s[0:2]}" if s else "??????"
+
+    def cd(s):
+        return "?" if "?" in s else check_digit(s)
+
+    lic = re.sub(r"\D", "", values.get("Licence_number") or "") or "?" * 10
+    num, d4 = lic[0:3] + lic[4:10], lic[3]
+    birth = yymmdd(values.get("Birth_date"))
+    sex = {"МУЖ.": "M", "ЖЕН.": "F"}.get(values.get("Sex_ru"), "?")
+    code = re.sub(r"\D", "", values.get("Issue_organisation_code") or "") or "??????"
+    opt = d4 + yymmdd(values.get("Issue_date")) + code
+    line = num + cd(num) + "RUS" + birth + cd(birth) + sex + "<" * 7 + opt + "<" + cd(opt + "<")
+    return line + cd(line[0:10] + line[13:20] + line[21:43])
+
+
+def confirmed_by_alignment(mrz, values, params):
+    """Поля viz, которые прочитанная строка 2 MRZ повторяет символ в символ.
+
+    Строка может быть испорчена (лишний или потерянный символ, ошибка в другом поле),
+    и тогда контрольные цифры не сходятся. Выравниваем её со строкой, построенной по
+    viz: поле подтверждено, если все его символы попали в совпавшие куски.
+    """
+    lines = (mrz or {}).get("lines") or []
+    if len(lines) < 2:
+        return set()
+    expected = expected_line2(values)
+    ops = SequenceMatcher(None, expected, lines[1]["text"], autojunk=False).get_opcodes()
+    same = {i for tag, i1, i2, _, _ in ops if tag == "equal" for i in range(i1, i2)}
+    need_check = params["mrz2_align_need_check"]
+    return {f for f, (span, check) in LINE2_SPANS.items()
+            if values.get(f) is not None and all(i in same for i in span)
+            and (not need_check or check in same)}
+
+
 def parse_mrz_line2(mrz):
     """Значения полей строки 2 и флаги, какие из них защищены контрольными цифрами."""
     lines = [ln["text"] for ln in (mrz or {}).get("lines") or []]
@@ -139,8 +218,14 @@ def diff_segments(truth, read):
     return [(truth[i1:i2], read[j1:j2]) for tag, i1, i2, j1, j2 in ops if tag != "equal"]
 
 
-def build_model(docs, labels):
-    """docs — предсказания train, labels — {doc_id: fields} к ним."""
+def build_model(docs, labels, word_model=None):
+    """docs — предсказания train, labels — {doc_id: fields} к ним.
+
+    word_model — ещё и обучить классификатор «слово прочитано неверно» (нужен scikit-learn);
+    по умолчанию — только если он включён в PARAMS.
+    """
+    if word_model is None:
+        word_model = any(v is not None for v in PARAMS["word_model_max_p"].values())
     sub = defaultdict(set)
     with open(ROOT / "reference" / "subdivisions.csv", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
@@ -165,9 +250,52 @@ def build_model(docs, labels):
             mrz_err.update(diff_segments(want, lines[0]["text"]))
     # слова справочника DaData в словарь не берём: формулировки там другие, а частоты
     # («ОБЛ.» тысячи раз) ломают правило near_ratio
-    return {"subdivisions": sub, "orgs": orgs, "words": words,
-            "word_index": {f: deletion_index(c) for f, c in words.items()},
-            "viz_err": viz_err, "mrz_err": mrz_err}
+    model = {"subdivisions": sub, "orgs": orgs, "words": words,
+             "word_index": {f: deletion_index(c) for f, c in words.items()},
+             "viz_err": viz_err, "mrz_err": mrz_err, "word_clf": None}
+    if word_model:
+        model["word_clf"] = train_word_model(docs, labels)
+    return model
+
+
+def train_word_model(docs, labels, folds=4):
+    """Градиентный бустинг: вероятность, что слово текстового поля прочитано неверно.
+
+    Признак «частота слова в train» у обучающего документа не должен видеть его же
+    разметку, поэтому признаки считаются по словарю без фолда этого документа.
+    """
+    try:
+        import numpy as np
+        from sklearn.ensemble import HistGradientBoostingClassifier
+    except ImportError:
+        print("scikit-learn не установлен: модель слов выключена, работают только правила"
+              " (pip install -r requirements.txt)", file=sys.stderr)
+        return None
+    X, y = [], []
+    for j in range(folds):
+        inner = build_model([d for i, d in enumerate(docs) if i % folds != j], labels, word_model=False)
+        for i, doc in enumerate(docs):
+            if i % folds == j:
+                rows, wrong = word_rows(doc, labels[doc["doc_id"]], inner)
+                X += rows
+                y += wrong
+    clf = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, random_state=0)
+    return clf.fit(np.array(X, float), np.array(y))
+
+
+def word_rows(doc, truth, model):
+    """Признаки слов текстовых полей и метка «прочитано неверно» по разметке truth."""
+    X, y = [], []
+    for field in TEXT_FIELDS:
+        text, confs = viz_chars(doc.get("viz"), field)
+        if text is None or lines_missing(doc.get("viz"), field):
+            continue
+        read = text.split(" ")
+        ops = SequenceMatcher(None, read, norm(truth[field]).split(), autojunk=False).get_opcodes()
+        right = {k for tag, i1, i2, _, _ in ops if tag == "equal" for k in range(i1, i2)}
+        X += field_word_features(field, text, confs, doc, model)
+        y += [k not in right for k in range(len(read))]
+    return X, y
 
 
 def load_model():
@@ -229,6 +357,23 @@ def parse_date(s):
         return None
 
 
+def fmt_date(s, fix):
+    """ДД.ММ.ГГГГ; с fix — ещё и из восьми цифр с потерянными/лишними точками."""
+    if parse_date(s):
+        return s
+    if fix and s and re.fullmatch(r"[\d. ]+", s) and len(re.sub(r"\D", "", s)) == 8:
+        d = re.sub(r"\D", "", s)
+        fixed = f"{d[0:2]}.{d[2:4]}.{d[4:8]}"
+        return fixed if parse_date(fixed) else None
+    return None
+
+
+def fmt_sex(s, fix):
+    if s in ("МУЖ.", "ЖЕН."):
+        return s
+    return s + "." if fix and s in ("МУЖ", "ЖЕН") else None
+
+
 def fmt_licence(s):
     digits = re.sub(r"\D", "", s or "")
     if len(digits) != 10 or re.sub(r"[\d ]", "", s or ""):
@@ -245,10 +390,10 @@ def fmt_code(s):
 
 # ---------------------------------------------------------------- ФИО: viz + MRZ
 
-def viz_only_names(viz, source, params):
+def viz_only_names(viz, profile, params):
     """MRZ нет: ФИО только по уверенности viz. Пустое отчество тогда не отличить от
     ненайденного, поэтому отчество обязано быть."""
-    thr = params["viz_only_min_conf"][source]
+    thr = params["viz_only_min_conf"][profile]
     if thr is None:
         return {}, ["ФИО: нет MRZ"]
     got = {}
@@ -287,7 +432,7 @@ def mrz_only_names(line, texts, params):
     return found
 
 
-def resolve_names(viz, mrz, source, model, params):
+def resolve_names(viz, mrz, profile, model, params):
     """Сверяем ФИО из viz со строкой 1 MRZ посимвольно.
 
     Строим строку 1 так, как она должна выглядеть по viz, и выравниваем с прочитанной.
@@ -296,7 +441,7 @@ def resolve_names(viz, mrz, source, model, params):
     """
     lines = (mrz or {}).get("lines") or []
     if not lines:
-        return viz_only_names(viz, source, params)
+        return viz_only_names(viz, profile, params)
     observed = lines[0]["text"]
 
     texts = {f: viz_chars(viz, f)[0] for f in NAME_FIELDS}
@@ -357,7 +502,7 @@ def resolve_names(viz, mrz, source, model, params):
         need, ratio = params["name_min_count"], params["name_ratio"]
         if votes_a >= need and like_a >= ratio * like_b:
             continue
-        if swap and "?" in right and votes_b == 0 and c_viz >= params["text_min_conf"][source] \
+        if swap and "?" in right and votes_b == 0 and c_viz >= params["text_min_conf"][profile] \
                 and "Ё" not in v:
             continue  # в MRZ символ, которого в именах не бывает (1, 0, 2, 5): MRZ ошиблась
         allowed = own and (swap or c_viz < params["name_fix_max_conf"])
@@ -372,7 +517,7 @@ def resolve_names(viz, mrz, source, model, params):
 
     # хвост длинного ФИО в MRZ не поместился: его подтверждает только уверенность viz
     cut = [o for o in origin_full[44:] if o]
-    thr = params["text_min_conf"][source]
+    thr = params["text_min_conf"][profile]
     for f, i in cut:
         if confs[f][i] < thr:
             why.append(f"{f}: обрезано в MRZ, низкая уверенность")
@@ -426,6 +571,20 @@ def neighbours(word, field, model):
             yield cand, cand[i1:i2], word[j1:j2], j1
 
 
+def restore_punct(word, field, model, params):
+    """«С» -> «С.», «РН» -> «Р-Н»: viz потеряла точку или дефис.
+
+    Восстанавливаем, только если без этого знака слово в train не встречается ни разу,
+    а со знаком — не реже punct_restore_min раз, и такой вариант один.
+    """
+    counts = model["words"][field]
+    if counts[word]:
+        return None
+    cands = {cand for cand, right, read, _ in neighbours(word, field, model)
+             if right in (".", "-") and not read and counts[cand] >= params["punct_restore_min"]}
+    return cands.pop() if len(cands) == 1 else None
+
+
 def looks_misread(word, field, model, params):
     """Уверенно прочитанное слово, в котором, похоже, пропал символ.
 
@@ -465,20 +624,58 @@ def fix_word(word, confs, field, model, params):
     return None
 
 
-def resolve_text(field, viz, source, model, params):
-    """Место рождения / Кем выдан: уверенность OCR плюс исправление по словарю слов."""
+def field_word_features(field, text, confs, doc, model):
+    """Признаки каждого слова поля для модели слов."""
+    q, source = doc.get("quality") or {}, doc.get("source")
+    counts = model["words"][field]
+    words = text.split(" ")
+    rows, pos = [], 0
+    for k, word in enumerate(words):
+        wc = sorted(confs[pos:pos + len(word)]) or [1.0]
+        pos += len(word) + 1
+        near = [counts[c] for c, *_ in neighbours(word, field, model)]
+        rows.append([
+            wc[0], wc[1] if len(wc) > 1 else 1.0, sum(wc) / len(wc), sum(c < 0.99 for c in wc),
+            len(word), any(ch.isdigit() for ch in word), "." in word, "-" in word,
+            math.log1p(counts[word]), math.log1p(max(near, default=0)), len(near),
+            source == "web", source == "mobile", source == "mobile_v2",
+            q.get("doc_px", 0), q.get("sharpness", 0), q.get("glare", 0),
+            field == "Birth_place_ru", k == 0, k == len(words) - 1, len(words),
+        ])
+    return rows
+
+
+def resolve_text(field, viz, profile, model, params, doc):
+    """Место рождения / Кем выдан: уверенность OCR, словарь слов и модель слов."""
     text, confs = viz_chars(viz, field)
     if text is None:
         return None, f"{field}: не найдено"
     if lines_missing(viz, field):
         return None, f"{field}: потеряна строка"
-    thr = params["text_min_conf"][source]
-    known_thr = params["known_word_min_conf"][source]
+    thr = params["text_min_conf"][profile]
+    known_thr = params["known_word_min_conf"][profile]
+    max_p, clf = params["word_model_max_p"][profile], model.get("word_clf")
+    risk = None
+    if clf is not None and max_p is not None:
+        risk = clf.predict_proba(field_word_features(field, text, confs, doc, model))[:, 1]
     out, pos = [], 0
-    for word in text.split(" "):
+    for k, word in enumerate(text.split(" ")):
         wc = confs[pos:pos + len(word)]
         pos += len(word) + 1
+        if risk is not None and params["word_model_mode"] == "replace":
+            if risk[k] <= max_p:
+                out.append(word)
+                continue
+            fixed = fix_word(word, wc, field, model, params) if params["word_fix"] else None
+            if fixed is None:
+                return None, f"{field}: модель: риск ошибки в «{word}» {risk[k]:.4f}"
+            out.append(fixed)
+            continue
         if min(wc, default=1.0) >= thr:
+            restored = restore_punct(word, field, model, params) if params["punct_restore"] else None
+            if restored:
+                out.append(restored)
+                continue
             if looks_misread(word, field, model, params):
                 return None, f"{field}: «{word}» похоже на потерю символа"
             out.append(word)
@@ -488,13 +685,15 @@ def resolve_text(field, viz, source, model, params):
             out.append(word)
             continue
         fixed = fix_word(word, wc, field, model, params) if params["word_fix"] else None
+        if fixed is None and risk is not None and risk[k] <= max_p:
+            fixed = word  # правила не уверены, а модель считает слово надёжным
         if fixed is None:
             return None, f"{field}: низкая уверенность в «{word}» ({min(wc):.3f})"
         out.append(fixed)
     return " ".join(out), None
 
 
-def resolve_org(code, viz, source, model, params):
+def resolve_org(code, viz, profile, model, params, doc):
     """Кем выдан: сначала словарь названий по коду, потом как обычный текст."""
     text, confs = viz_chars(viz, "Issue_organization_ru")
     known = model["orgs"].get(code, {}) if code else {}
@@ -511,23 +710,23 @@ def resolve_org(code, viz, source, model, params):
                 fits.append(name)
         if len(fits) == 1:
             return fits[0], None
-    return resolve_text("Issue_organization_ru", viz, source, model, params)
+    return resolve_text("Issue_organization_ru", viz, profile, model, params, doc)
 
 
 # ---------------------------------------------------------------- всё вместе
 
 def resolve(doc, model, params):
-    viz, source = doc.get("viz") or {}, doc.get("source")
-    fields, why = resolve_names(viz, doc.get("mrz"), source, model, params)
+    viz, profile = doc.get("viz") or {}, photo_profile(doc, params)
+    fields, why = resolve_names(viz, doc.get("mrz"), profile, model, params)
 
     l2 = parse_mrz_line2(doc.get("mrz"))
     raw = {f: viz_chars(viz, f)[0] for f in FIELDS}
     viz_vals = {
         "Licence_number": fmt_licence(raw["Licence_number"]),
-        "Birth_date": raw["Birth_date"] if parse_date(raw["Birth_date"]) else None,
-        "Issue_date": raw["Issue_date"] if parse_date(raw["Issue_date"]) else None,
+        "Birth_date": fmt_date(raw["Birth_date"], params["fix_format"]),
+        "Issue_date": fmt_date(raw["Issue_date"], params["fix_format"]),
         "Issue_organisation_code": fmt_code(raw["Issue_organisation_code"]),
-        "Sex_ru": raw["Sex_ru"] if raw["Sex_ru"] in ("МУЖ.", "ЖЕН.") else None,
+        "Sex_ru": fmt_sex(raw["Sex_ru"], params["fix_format"]),
     }
     checks = {
         "Licence_number": ("licence", l2.get("ok_num") and l2.get("ok_opt")),
@@ -536,24 +735,36 @@ def resolve(doc, model, params):
         "Issue_organisation_code": ("code", l2.get("ok_opt")),
         "Sex_ru": ("sex", l2.get("ok_all")),
     }
+    aligned = confirmed_by_alignment(doc.get("mrz"), viz_vals, params) if params["mrz2_align"] else set()
     for field, (key, ok) in checks.items():
         conf = min(viz_chars(viz, field)[1] or [0.0])
         val, err = resolve_mrz_field(field, viz_vals[field], conf, l2.get(key), ok,
-                                     params["viz_only_min_conf"][source], params)
+                                     params["viz_only_min_conf"][profile], params)
+        if err and field in aligned:
+            val, err = viz_vals[field], None
         if err:
             why.append(err)
         else:
             fields[field] = val
 
     for field, (val, err) in [
-        ("Issue_organization_ru", resolve_org(fields.get("Issue_organisation_code"), viz, source, model, params)),
-        ("Birth_place_ru", resolve_text("Birth_place_ru", viz, source, model, params)),
+        ("Issue_organization_ru",
+         resolve_org(fields.get("Issue_organisation_code"), viz, profile, model, params, doc)),
+        ("Birth_place_ru", resolve_text("Birth_place_ru", viz, profile, model, params, doc)),
     ]:
         if err:
             why.append(err)
         else:
             fields[field] = val
     return fields, why
+
+
+def photo_profile(doc, params):
+    """Ключ порогов: источник снимка и «_bad», если снимок плохой."""
+    q, cut = doc.get("quality") or {}, params["bad_photo"]
+    bad = (q.get("doc_px", 0) < cut["doc_px"] or q.get("sharpness", 0) < cut["sharpness"]
+           or q.get("glare", 1) > cut["glare"])
+    return doc.get("source") + ("_bad" if bad else "")
 
 
 def add_years(d, n):

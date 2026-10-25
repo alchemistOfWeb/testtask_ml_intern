@@ -80,6 +80,10 @@ def by_source_conf(value_web, value_mobile, value_v2):
 
 GRID = {
     # каждый вариант меняет один параметр относительно PARAMS
+    "mrz2_align off": variant(mrz2_align=False),
+    "punct_restore off": variant(punct_restore=False),
+    "punct_restore_min 5": variant(punct_restore_min=5),
+    "fix_format off": variant(fix_format=False),
     "text 0.95": variant(text_min_conf=by_source_conf(0.95, 0.95, 0.999)),
     "text 0.90": variant(text_min_conf=by_source_conf(0.9, 0.9, 0.999)),
     "text v2 0.995": variant(text_min_conf=by_source_conf(0.93, 0.93, 0.995)),
