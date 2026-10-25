@@ -1,18 +1,16 @@
-# данные задания: выдаются вместе с заданием, в репозиторий не кладём
+# task data is distributed with the task, not with the repository
 data/
 
-# Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 .ipynb_checkpoints/
 
-# результаты прогонов на train (answers.jsonl для test — в репозитории)
+# train runs; answers.jsonl for test is committed
 train_answers*.jsonl
 *.log
 
-# редакторы и ОС
 .vscode/
 .idea/
 .DS_Store
